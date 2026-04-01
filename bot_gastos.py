@@ -1,26 +1,27 @@
 import gspread
 import os
 import json
+import re
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, CommandHandler, ContextTypes
 from datetime import datetime
-import calendar
 
 # ── Configuración ──────────────────────────────────────────
 TOKEN              = "8728321922:AAH19ysCMCgXKTzSrCV4A9R3ApQMZI2O5sc"
 CHAT_ID            = "1008711489"
 SHEET_ID           = "1ewM2suj2crbwrZkinizmEvZx3pVDuaR3yNG8VudvM6w"
 CREDS              = "credenciales.json"
-PRESUPUESTO_Q1     = 2800000
-PRESUPUESTO_Q2     = 2200000
-ALERTA_PORCENTAJE  = 0.70
-CRITICO_PORCENTAJE = 0.90
 # ───────────────────────────────────────────────────────────
 
-PALABRAS_INGRESO = ["pago", "ingreso", "quincena", "salario", "sueldo", "me pagaron", "cobré", "registro valor inicial", "saldo de"]
-PALABRAS_RESUMEN = ["resumen", "dame el resumen", "quiero el resumen", "resumen del mes"]
-PALABRAS_SALDO   = ["saldo", "dame el saldo", "dame mi saldo", "cuanto me queda", "cuánto me queda", "mi saldo"]
+MESES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
+}
+
+PALABRAS_RESUMEN = ["dame el resumen", "quiero el resumen", "resumen del mes", "dame un resumen", "reporte"]
+PALABRAS_SALDO   = ["dame el saldo", "dame mi saldo", "cuanto me queda", "cuánto me queda", "mi saldo", "ver saldo"]
 PALABRAS_BORRAR  = ["borrar memoria", "borrar todo", "empezar de ceros", "resetear"]
 
 def conectar_sheet():
@@ -40,151 +41,179 @@ def detectar_categoria(descripcion):
         "🍽️ Comida":          ["almuerzo", "comida", "restaurante", "pizza", "hamburguesa", "cafe", "desayuno", "cena", "empanada", "arepa"],
         "🛒 Mercado":         ["mercado", "supermercado", "exito", "jumbo", "d1", "ara", "verduras", "carnes"],
         "🚌 Transporte":      ["uber", "taxi", "bus", "transporte", "metro", "mio", "transmilenio", "gasolina"],
-        "💳 Deudas":          ["cuota", "deuda", "credito", "prestamo", "banco", "tarjeta", "obligacion"],
+        "💳 Deudas":          ["cuota", "deuda", "credito", "prestamo", "banco", "tarjeta", "obligacion", "hipo", "abono"],
         "🎬 Entretenimiento": ["netflix", "spotify", "cine", "juego", "entretenimiento", "prime", "disney"],
         "💊 Salud":           ["farmacia", "medico", "salud", "drogas", "clinica", "medicina", "hospital"],
         "👕 Ropa":            ["ropa", "zapatos", "camisa", "pantalon", "vestido", "calzado"],
         "📱 Tecnología":      ["celular", "internet", "tecnologia", "computador", "cable", "plan"],
         "🏠 Hogar":           ["arriendo", "servicios", "agua", "luz", "gas", "hogar", "casa"],
+        "🏧 Retiro":          ["retiro", "cajero", "efectivo"],
     }
     for categoria, palabras in categorias.items():
         if any(p in descripcion for p in palabras):
             return categoria
     return "📦 Otros"
 
-def obtener_quincena(fecha):
-    return "Q1" if fecha.day <= 15 else "Q2"
+def detectar_quincena_ingreso(descripcion):
+    descripcion = descripcion.lower()
+    if any(p in descripcion for p in ["primera", "q1", "quincena 1"]):
+        return "Q1"
+    elif any(p in descripcion for p in ["segunda", "q2", "quincena 2"]):
+        return "Q2"
+    elif any(p in descripcion for p in ["valor inicial", "inicial"]):
+        return "Q2"  # el valor inicial se asocia a Q2 por defecto
+    return "Q2"  # si no especifica, Q2 por defecto
 
-def obtener_total_ingresos(sheet, mes, anio):
+def obtener_quincena_activa(sheet):
+    """Retorna la quincena del último ingreso registrado"""
     registros = sheet.get_all_records()
-    total = 0
+    for r in reversed(registros):
+        if r["Categoría"] == "💵 Ingreso":
+            return r["Quincena"]
+    return "Q2"  # por defecto si no hay ingresos
+
+def calcular_saldo_historico(sheet):
+    registros = sheet.get_all_records()
+    total_ingresos = 0
+    total_gastos   = 0
+    for r in registros:
+        try:
+            valor = float(r["Valor"])
+            if r["Categoría"] == "💵 Ingreso":
+                total_ingresos += valor
+            else:
+                total_gastos += valor
+        except:
+            continue
+    return total_ingresos, total_gastos
+
+def filtrar_registros_por_mes(registros, mes, anio):
+    resultado = []
     for r in registros:
         try:
             fecha = datetime.strptime(r["Fecha"], "%d/%m/%Y")
-            if fecha.month == mes and fecha.year == anio and r["Categoría"] == "💵 Ingreso":
-                total += float(r["Valor"])
+            if fecha.month == mes and fecha.year == anio:
+                resultado.append(r)
         except:
             continue
-    return total
+    return resultado
 
-def obtener_total_gastos(sheet, mes, anio):
-    registros = sheet.get_all_records()
-    total = 0
+def filtrar_registros_por_rango(registros, fecha_inicio, fecha_fin):
+    resultado = []
     for r in registros:
         try:
             fecha = datetime.strptime(r["Fecha"], "%d/%m/%Y")
-            if fecha.month == mes and fecha.year == anio and r["Categoría"] != "💵 Ingreso":
-                total += float(r["Valor"])
+            if fecha_inicio <= fecha <= fecha_fin:
+                resultado.append(r)
         except:
             continue
-    return total
+    return resultado
 
-def obtener_gastos_quincena(sheet, quincena, mes, anio):
-    registros = sheet.get_all_records()
-    total = 0
+def filtrar_registros_por_quincena(registros, quincena):
+    return [r for r in registros if r.get("Quincena") == quincena]
+
+def generar_resumen_registros(registros, titulo):
+    total_ingresos = 0
+    total_gastos   = 0
+    categorias     = {}
+
     for r in registros:
         try:
-            fecha = datetime.strptime(r["Fecha"], "%d/%m/%Y")
-            if fecha.month == mes and fecha.year == anio and r["Quincena"] == quincena:
-                if r["Categoría"] != "💵 Ingreso":
-                    total += float(r["Valor"])
+            valor = float(r["Valor"])
+            if r["Categoría"] == "💵 Ingreso":
+                total_ingresos += valor
+            else:
+                total_gastos += valor
+                cat = r["Categoría"] or "📦 Otros"
+                categorias[cat] = categorias.get(cat, 0) + valor
         except:
             continue
-    return total
 
-async def verificar_alerta(update, quincena, total_gastado):
-    presupuesto = PRESUPUESTO_Q1 if quincena == "Q1" else PRESUPUESTO_Q2
-    porcentaje  = total_gastado / presupuesto
+    if not categorias and total_ingresos == 0:
+        return f"📭 No hay registros en {titulo}."
 
-    if porcentaje >= CRITICO_PORCENTAJE:
-        restante = presupuesto - total_gastado
-        await update.message.reply_text(
-            f"🚨 <b>ALERTA CRÍTICA</b>\n"
-            f"Llevas gastado el <b>{porcentaje*100:.0f}%</b> de tu quincena\n"
-            f"Gastado: ${total_gastado:,.0f}\n"
-            f"Presupuesto: ${presupuesto:,.0f}\n"
-            f"Te quedan: <b>${restante:,.0f}</b>\n"
-            f"⚠️ Estás casi sin presupuesto",
-            parse_mode="HTML"
-        )
-    elif porcentaje >= ALERTA_PORCENTAJE:
-        restante = presupuesto - total_gastado
-        await update.message.reply_text(
-            f"⚠️ <b>ALERTA</b>\n"
-            f"Llevas gastado el <b>{porcentaje*100:.0f}%</b> de tu quincena\n"
-            f"Gastado: ${total_gastado:,.0f}\n"
-            f"Presupuesto: ${presupuesto:,.0f}\n"
-            f"Te quedan: <b>${restante:,.0f}</b>",
-            parse_mode="HTML"
-        )
+    categorias_ord = sorted(categorias.items(), key=lambda x: x[1], reverse=True)
+    detalle = ""
+    for cat, val in categorias_ord:
+        pct = (val / total_gastos * 100) if total_gastos > 0 else 0
+        detalle += f"{cat}: ${val:,.0f} ({pct:.0f}%)\n"
 
-async def mostrar_saldo(update):
-    fecha         = datetime.now()
-    sheet         = conectar_sheet()
-    total_ingres  = obtener_total_ingresos(sheet, fecha.month, fecha.year)
-    total_gastos  = obtener_total_gastos(sheet, fecha.month, fecha.year)
-    disponible    = total_ingres - total_gastos
-    porcentaje    = (total_gastos / total_ingres * 100) if total_ingres > 0 else 0
+    disponible = total_ingresos - total_gastos
+
+    return (
+        f"📊 <b>Resumen — {titulo}</b>\n\n"
+        f"{detalle}\n"
+        f"💵 Total ingresos: ${total_ingresos:,.0f}\n"
+        f"💸 Total gastado: ${total_gastos:,.0f}\n"
+        f"📉 Disponible: <b>${disponible:,.0f}</b>"
+    )
+
+async def mostrar_saldo(update, sheet):
+    total_ingresos, total_gastos = calcular_saldo_historico(sheet)
+    disponible  = total_ingresos - total_gastos
+    porcentaje  = (total_gastos / total_ingresos * 100) if total_ingresos > 0 else 0
+    quincena    = obtener_quincena_activa(sheet)
 
     aviso = ""
-    if total_ingres == 0:
-        aviso = "\n⚠️ <i>Aún no has registrado ningún ingreso.\nEscribe: saldo inicial 500000</i>"
+    if total_ingresos == 0:
+        aviso = "\n⚠️ <i>Aún no has registrado ningún ingreso.\nEscribe: ingreso: registro valor inicial 500000</i>"
 
     await update.message.reply_text(
-        f"💰 <b>Tu saldo disponible</b>\n\n"
-        f"Total ingresos: ${total_ingres:,.0f}\n"
+        f"💰 <b>Tu saldo disponible</b>\n"
+        f"📌 Quincena activa: <b>{quincena}</b>\n\n"
+        f"Total ingresos: ${total_ingresos:,.0f}\n"
         f"Total gastado: ${total_gastos:,.0f} ({porcentaje:.0f}%)\n"
         f"💵 Disponible: <b>${disponible:,.0f}</b>"
         f"{aviso}",
         parse_mode="HTML"
     )
 
-async def mostrar_resumen(update):
-    fecha       = datetime.now()
-    sheet       = conectar_sheet()
-    registros   = sheet.get_all_records()
-    mes_actual  = fecha.month
-    anio_actual = fecha.year
-    nombre_mes  = calendar.month_name[mes_actual]
+async def procesar_resumen(update, texto, sheet):
+    registros = sheet.get_all_records()
 
-    total      = 0
-    categorias = {}
+    # Detectar rango: "de enero a marzo 2026"
+    rango = re.search(r"de (\w+) a (\w+)(?: (\d{4}))?", texto)
+    if rango:
+        mes_inicio_str = rango.group(1)
+        mes_fin_str    = rango.group(2)
+        anio           = int(rango.group(3)) if rango.group(3) else datetime.now().year
+        mes_inicio     = MESES.get(mes_inicio_str)
+        mes_fin        = MESES.get(mes_fin_str)
+        if mes_inicio and mes_fin:
+            fecha_inicio = datetime(anio, mes_inicio, 1)
+            ultimo_dia   = 31 if mes_fin in [1,3,5,7,8,10,12] else 30
+            fecha_fin    = datetime(anio, mes_fin, ultimo_dia)
+            filtrados    = filtrar_registros_por_rango(registros, fecha_inicio, fecha_fin)
+            titulo       = f"{mes_inicio_str.capitalize()} a {mes_fin_str.capitalize()} {anio}"
+            await update.message.reply_text(generar_resumen_registros(filtrados, titulo), parse_mode="HTML")
+            return
 
-    for r in registros:
-        try:
-            f = datetime.strptime(r["Fecha"], "%d/%m/%Y")
-            if f.month == mes_actual and f.year == anio_actual and r["Categoría"] != "💵 Ingreso":
-                valor = float(r["Valor"])
-                total += valor
-                cat   = r["Categoría"] or "📦 Otros"
-                categorias[cat] = categorias.get(cat, 0) + valor
-        except:
-            continue
+    # Detectar mes específico: "de marzo 2026"
+    mes_especifico = re.search(r"de (\w+)(?: (\d{4}))?", texto)
+    if mes_especifico:
+        mes_str = mes_especifico.group(1)
+        anio    = int(mes_especifico.group(2)) if mes_especifico.group(2) else datetime.now().year
+        mes     = MESES.get(mes_str)
+        if mes:
+            filtrados = filtrar_registros_por_mes(registros, mes, anio)
+            titulo    = f"{mes_str.capitalize()} {anio}"
+            await update.message.reply_text(generar_resumen_registros(filtrados, titulo), parse_mode="HTML")
+            return
 
-    if not categorias:
-        await update.message.reply_text(f"📭 No hay gastos registrados en {nombre_mes}.")
+    # Detectar quincena: "de q1" o "de q2"
+    if "q1" in texto:
+        filtrados = filtrar_registros_por_quincena(registros, "Q1")
+        await update.message.reply_text(generar_resumen_registros(filtrados, "Quincena 1"), parse_mode="HTML")
+        return
+    if "q2" in texto:
+        filtrados = filtrar_registros_por_quincena(registros, "Q2")
+        await update.message.reply_text(generar_resumen_registros(filtrados, "Quincena 2"), parse_mode="HTML")
         return
 
-    categorias_ord = sorted(categorias.items(), key=lambda x: x[1], reverse=True)
-    detalle = ""
-    for cat, val in categorias_ord:
-        pct = (val / total) * 100
-        detalle += f"{cat}: ${val:,.0f} ({pct:.0f}%)\n"
+    # Resumen histórico completo
+    await update.message.reply_text(generar_resumen_registros(registros, "Historial completo"), parse_mode="HTML")
 
-    total_ingres = obtener_total_ingresos(sheet, mes_actual, anio_actual)
-    disponible   = total_ingres - total
-
-    await update.message.reply_text(
-        f"📊 <b>Resumen de {nombre_mes} {anio_actual}</b>\n\n"
-        f"{detalle}\n"
-        f"💸 <b>Total gastado: ${total:,.0f}</b>\n"
-        f"💵 Total ingresos: ${total_ingres:,.0f}\n"
-        f"📉 Disponible: <b>${disponible:,.0f}</b>",
-        parse_mode="HTML"
-    )
-
-async def borrar_memoria(update):
-    sheet = conectar_sheet()
+async def borrar_memoria(update, sheet):
     sheet.clear()
     sheet.append_row(["Fecha", "Categoría", "Descripción", "Valor", "Quincena"])
     await update.message.reply_text(
@@ -197,102 +226,131 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.message.chat_id) != CHAT_ID:
         return
 
-    texto = update.message.text.strip().lower()
+    texto       = update.message.text.strip()
+    texto_lower = texto.lower()
+    sheet       = conectar_sheet()
 
-    # Detectar borrar memoria
-    if any(p in texto for p in PALABRAS_BORRAR):
-        await borrar_memoria(update)
+    # Borrar memoria
+    if any(p in texto_lower for p in PALABRAS_BORRAR):
+        await borrar_memoria(update, sheet)
         return
 
-    # Detectar resumen
-    if any(p in texto for p in PALABRAS_RESUMEN):
-        await mostrar_resumen(update)
+    # Resumen
+    if any(p in texto_lower for p in PALABRAS_RESUMEN):
+        await procesar_resumen(update, texto_lower, sheet)
         return
 
-    # Detectar saldo
-    if any(p in texto for p in PALABRAS_SALDO):
-        await mostrar_saldo(update)
+    # Saldo
+    if any(p in texto_lower for p in PALABRAS_SALDO):
+        await mostrar_saldo(update, sheet)
         return
 
-    # Registrar gasto o ingreso
-    partes = update.message.text.strip().rsplit(" ", 1)
-    if len(partes) != 2:
-        await update.message.reply_text(
-            "⚠️ No entendí. Ejemplos:\n"
-            "<i>almuerzo 15000</i>\n"
-            "<i>saldo inicial 850000</i>\n"
-            "<i>pago segunda quincena 2200000</i>\n"
-            "<i>dame el saldo</i>\n"
-            "<i>dame el resumen</i>\n"
-            "<i>borrar memoria</i>",
-            parse_mode="HTML"
-        )
-        return
+    # Ingreso
+    if texto_lower.startswith("ingreso:"):
+        contenido = texto[8:].strip()
+        partes    = contenido.rsplit(" ", 1)
+        if len(partes) != 2:
+            await update.message.reply_text(
+                "⚠️ Formato incorrecto. Ejemplo:\n"
+                "<i>ingreso: pago segunda quincena 2200000</i>",
+                parse_mode="HTML"
+            )
+            return
+        descripcion = partes[0].strip()
+        try:
+            valor = float(partes[1].replace(",", "").replace(".", ""))
+        except:
+            await update.message.reply_text("⚠️ El valor debe ser un número.", parse_mode="HTML")
+            return
 
-    descripcion = partes[0].strip()
-    try:
-        valor = float(partes[1].replace(",", "").replace(".", ""))
-    except:
-        await update.message.reply_text(
-            "⚠️ No entendí. Ejemplos:\n"
-            "<i>almuerzo 15000</i>\n"
-            "<i>saldo inicial 850000</i>\n"
-            "<i>pago segunda quincena 2200000</i>\n"
-            "<i>dame el saldo</i>\n"
-            "<i>dame el resumen</i>\n"
-            "<i>borrar memoria</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    fecha    = datetime.now()
-    quincena = obtener_quincena(fecha)
-    sheet    = conectar_sheet()
-
-    if any(p in descripcion.lower() for p in PALABRAS_INGRESO):
+        fecha    = datetime.now()
+        quincena = detectar_quincena_ingreso(descripcion)
         sheet.append_row([fecha.strftime("%d/%m/%Y"), "💵 Ingreso", descripcion, valor, quincena])
-        total_ingres = obtener_total_ingresos(sheet, fecha.month, fecha.year)
-        total_gastos = obtener_total_gastos(sheet, fecha.month, fecha.year)
-        disponible   = total_ingres - total_gastos
+        total_ingresos, total_gastos = calcular_saldo_historico(sheet)
+        disponible = total_ingresos - total_gastos
+
         await update.message.reply_text(
             f"✅ <b>Ingreso registrado</b>\n"
+            f"📌 Quincena: <b>{quincena}</b>\n"
             f"💵 {descripcion}: ${valor:,.0f}\n\n"
-            f"Total ingresos: ${total_ingres:,.0f}\n"
+            f"Total ingresos: ${total_ingresos:,.0f}\n"
             f"Total gastado: ${total_gastos:,.0f}\n"
             f"💰 Disponible: <b>${disponible:,.0f}</b>",
             parse_mode="HTML"
         )
-    else:
+        return
+
+    # Egreso
+    if texto_lower.startswith("egreso:"):
+        contenido = texto[7:].strip()
+        partes    = contenido.rsplit(" ", 1)
+        if len(partes) != 2:
+            await update.message.reply_text(
+                "⚠️ Formato incorrecto. Ejemplo:\n"
+                "<i>egreso: almuerzo 15000</i>",
+                parse_mode="HTML"
+            )
+            return
+        descripcion = partes[0].strip()
+        try:
+            valor = float(partes[1].replace(",", "").replace(".", ""))
+        except:
+            await update.message.reply_text("⚠️ El valor debe ser un número.", parse_mode="HTML")
+            return
+
+        fecha         = datetime.now()
+        quincena      = obtener_quincena_activa(sheet)
         categoria     = detectar_categoria(descripcion)
         sheet.append_row([fecha.strftime("%d/%m/%Y"), categoria, descripcion, valor, quincena])
-        total_ingres  = obtener_total_ingresos(sheet, fecha.month, fecha.year)
-        total_gastos  = obtener_total_gastos(sheet, fecha.month, fecha.year)
-        disponible    = total_ingres - total_gastos
+        total_ingresos, total_gastos = calcular_saldo_historico(sheet)
+        disponible    = total_ingresos - total_gastos
 
         await update.message.reply_text(
-            f"✅ <b>Registrado</b>\n"
+            f"✅ <b>Egreso registrado</b>\n"
+            f"📌 Quincena: <b>{quincena}</b>\n"
             f"{categoria} {descripcion}\n"
             f"💵 ${valor:,.0f}\n\n"
             f"Total gastado: ${total_gastos:,.0f}\n"
             f"💰 Disponible: <b>${disponible:,.0f}</b>",
             parse_mode="HTML"
         )
-        await verificar_alerta(update, quincena, obtener_gastos_quincena(sheet, quincena, fecha.month, fecha.year))
+        return
+
+    # No entendió
+    await update.message.reply_text(
+        "⚠️ No entendí. Ejemplos:\n\n"
+        "<i>ingreso: pago segunda quincena 2200000</i>\n"
+        "<i>ingreso: pago primera quincena 2800000</i>\n"
+        "<i>egreso: almuerzo 15000</i>\n"
+        "<i>egreso: pago credito hipo 340000</i>\n"
+        "<i>dame el saldo</i>\n"
+        "<i>dame el resumen</i>\n"
+        "<i>dame el resumen de marzo 2026</i>\n"
+        "<i>dame el resumen de enero a marzo 2026</i>\n"
+        "<i>dame el resumen de q1</i>\n"
+        "<i>borrar memoria</i>",
+        parse_mode="HTML"
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>Hola Alexis!</b>\n\n"
-        "Escríbeme de forma natural:\n\n"
-        "📝 <b>Registrar gasto:</b>\n"
-        "<i>almuerzo 15000</i>\n\n"
-        "💵 <b>Registrar saldo inicial:</b>\n"
-        "<i>saldo inicial 850000</i>\n\n"
-        "💵 <b>Registrar ingreso de quincena:</b>\n"
-        "<i>pago segunda quincena 2200000</i>\n\n"
+        "<b>¿Cómo registrar?</b>\n\n"
+        "💵 <b>Ingresos:</b>\n"
+        "<i>ingreso: pago primera quincena 2800000</i>\n"
+        "<i>ingreso: pago segunda quincena 2200000</i>\n"
+        "<i>ingreso: registro valor inicial 1732483</i>\n\n"
+        "💸 <b>Egresos:</b>\n"
+        "<i>egreso: almuerzo 15000</i>\n"
+        "<i>egreso: pago credito hipo 340000</i>\n"
+        "<i>egreso: retiro cajero 50000</i>\n\n"
         "💰 <b>Ver saldo:</b>\n"
         "<i>dame el saldo</i>\n\n"
         "📊 <b>Ver resumen:</b>\n"
-        "<i>dame el resumen</i>\n\n"
+        "<i>dame el resumen</i>\n"
+        "<i>dame el resumen de marzo 2026</i>\n"
+        "<i>dame el resumen de enero a marzo 2026</i>\n"
+        "<i>dame el resumen de q1</i>\n\n"
         "🗑️ <b>Borrar historial:</b>\n"
         "<i>borrar memoria</i>",
         parse_mode="HTML"
