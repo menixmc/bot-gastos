@@ -12,6 +12,7 @@ TOKEN              = "8728321922:AAH19ysCMCgXKTzSrCV4A9R3ApQMZI2O5sc"
 CHAT_ID            = "1008711489"
 SHEET_ID           = "1ewM2suj2crbwrZkinizmEvZx3pVDuaR3yNG8VudvM6w"
 CREDS              = "credenciales.json"
+TASA_4X1000        = 0.004
 # ───────────────────────────────────────────────────────────
 
 MESES = {
@@ -23,6 +24,9 @@ MESES = {
 PALABRAS_RESUMEN = ["dame el resumen", "quiero el resumen", "resumen del mes", "dame un resumen", "reporte"]
 PALABRAS_SALDO   = ["dame el saldo", "dame mi saldo", "cuanto me queda", "cuánto me queda", "mi saldo", "ver saldo"]
 PALABRAS_BORRAR  = ["borrar memoria", "borrar todo", "empezar de ceros", "resetear"]
+
+def calcular_4x1000(total_gastos):
+    return round(total_gastos * TASA_4X1000)
 
 def conectar_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -60,17 +64,14 @@ def detectar_quincena_ingreso(descripcion):
         return "Q1"
     elif any(p in descripcion for p in ["segunda", "q2", "quincena 2"]):
         return "Q2"
-    elif any(p in descripcion for p in ["valor inicial", "inicial"]):
-        return "Q2"  # el valor inicial se asocia a Q2 por defecto
-    return "Q2"  # si no especifica, Q2 por defecto
+    return "Q2"
 
 def obtener_quincena_activa(sheet):
-    """Retorna la quincena del último ingreso registrado"""
     registros = sheet.get_all_records()
     for r in reversed(registros):
         if r["Categoría"] == "💵 Ingreso":
             return r["Quincena"]
-    return "Q2"  # por defecto si no hay ingresos
+    return "Q2"
 
 def calcular_saldo_historico(sheet):
     registros = sheet.get_all_records()
@@ -138,21 +139,27 @@ def generar_resumen_registros(registros, titulo):
         pct = (val / total_gastos * 100) if total_gastos > 0 else 0
         detalle += f"{cat}: ${val:,.0f} ({pct:.0f}%)\n"
 
-    disponible = total_ingresos - total_gastos
+    impuesto      = calcular_4x1000(total_gastos)
+    disponible    = total_ingresos - total_gastos
+    disponible_c4 = total_ingresos - total_gastos - impuesto
 
     return (
         f"📊 <b>Resumen — {titulo}</b>\n\n"
         f"{detalle}\n"
         f"💵 Total ingresos: ${total_ingresos:,.0f}\n"
         f"💸 Total gastado: ${total_gastos:,.0f}\n"
-        f"📉 Disponible: <b>${disponible:,.0f}</b>"
+        f"🏦 4x1000 acumulado: ${impuesto:,.0f}\n\n"
+        f"📊 Sin 4x1000: <b>${disponible:,.0f}</b>\n"
+        f"📊 Con 4x1000: <b>${disponible_c4:,.0f}</b>"
     )
 
 async def mostrar_saldo(update, sheet):
     total_ingresos, total_gastos = calcular_saldo_historico(sheet)
-    disponible  = total_ingresos - total_gastos
-    porcentaje  = (total_gastos / total_ingresos * 100) if total_ingresos > 0 else 0
-    quincena    = obtener_quincena_activa(sheet)
+    impuesto      = calcular_4x1000(total_gastos)
+    disponible    = total_ingresos - total_gastos
+    disponible_c4 = total_ingresos - total_gastos - impuesto
+    porcentaje    = (total_gastos / total_ingresos * 100) if total_ingresos > 0 else 0
+    quincena      = obtener_quincena_activa(sheet)
 
     aviso = ""
     if total_ingresos == 0:
@@ -163,7 +170,9 @@ async def mostrar_saldo(update, sheet):
         f"📌 Quincena activa: <b>{quincena}</b>\n\n"
         f"Total ingresos: ${total_ingresos:,.0f}\n"
         f"Total gastado: ${total_gastos:,.0f} ({porcentaje:.0f}%)\n"
-        f"💵 Disponible: <b>${disponible:,.0f}</b>"
+        f"🏦 4x1000 acumulado: ${impuesto:,.0f}\n\n"
+        f"📊 Sin 4x1000: <b>${disponible:,.0f}</b>\n"
+        f"📊 Con 4x1000: <b>${disponible_c4:,.0f}</b>"
         f"{aviso}",
         parse_mode="HTML"
     )
@@ -200,7 +209,7 @@ async def procesar_resumen(update, texto, sheet):
             await update.message.reply_text(generar_resumen_registros(filtrados, titulo), parse_mode="HTML")
             return
 
-    # Detectar quincena: "de q1" o "de q2"
+    # Detectar quincena
     if "q1" in texto:
         filtrados = filtrar_registros_por_quincena(registros, "Q1")
         await update.message.reply_text(generar_resumen_registros(filtrados, "Quincena 1"), parse_mode="HTML")
@@ -267,7 +276,9 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quincena = detectar_quincena_ingreso(descripcion)
         sheet.append_row([fecha.strftime("%d/%m/%Y"), "💵 Ingreso", descripcion, valor, quincena])
         total_ingresos, total_gastos = calcular_saldo_historico(sheet)
-        disponible = total_ingresos - total_gastos
+        impuesto      = calcular_4x1000(total_gastos)
+        disponible    = total_ingresos - total_gastos
+        disponible_c4 = total_ingresos - total_gastos - impuesto
 
         await update.message.reply_text(
             f"✅ <b>Ingreso registrado</b>\n"
@@ -275,7 +286,9 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 {descripcion}: ${valor:,.0f}\n\n"
             f"Total ingresos: ${total_ingresos:,.0f}\n"
             f"Total gastado: ${total_gastos:,.0f}\n"
-            f"💰 Disponible: <b>${disponible:,.0f}</b>",
+            f"🏦 4x1000 acumulado: ${impuesto:,.0f}\n\n"
+            f"📊 Sin 4x1000: <b>${disponible:,.0f}</b>\n"
+            f"📊 Con 4x1000: <b>${disponible_c4:,.0f}</b>",
             parse_mode="HTML"
         )
         return
@@ -303,7 +316,9 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         categoria     = detectar_categoria(descripcion)
         sheet.append_row([fecha.strftime("%d/%m/%Y"), categoria, descripcion, valor, quincena])
         total_ingresos, total_gastos = calcular_saldo_historico(sheet)
+        impuesto      = calcular_4x1000(total_gastos)
         disponible    = total_ingresos - total_gastos
+        disponible_c4 = total_ingresos - total_gastos - impuesto
 
         await update.message.reply_text(
             f"✅ <b>Egreso registrado</b>\n"
@@ -311,7 +326,9 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{categoria} {descripcion}\n"
             f"💵 ${valor:,.0f}\n\n"
             f"Total gastado: ${total_gastos:,.0f}\n"
-            f"💰 Disponible: <b>${disponible:,.0f}</b>",
+            f"🏦 4x1000 acumulado: ${impuesto:,.0f}\n\n"
+            f"📊 Sin 4x1000: <b>${disponible:,.0f}</b>\n"
+            f"📊 Con 4x1000: <b>${disponible_c4:,.0f}</b>",
             parse_mode="HTML"
         )
         return
